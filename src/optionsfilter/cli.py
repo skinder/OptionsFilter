@@ -67,6 +67,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--login", action="store_true", help="authorize with Robinhood and exit")
     p.add_argument("--logout", action="store_true", help="delete cached tokens and exit")
     args = p.parse_args(argv)
+    if args.symbols:  # accept "AAPL MSFT" or "AAPL,MSFT" as one argument (VS Code prompt)
+        args.symbols = [s for arg in args.symbols for s in arg.replace(",", " ").split()]
 
     if args.logout:
         FileTokenStorage().clear()

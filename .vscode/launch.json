@@ -1,0 +1,69 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Screener: all (sell puts + buys)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Screener: sell puts",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--mode", "sell-put"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: covered calls",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--mode", "sell-call"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: buys",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--mode", "buy"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: relaxed spread 5% + CSV",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--max-spread", "0.05", "--csv", "today.csv"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: my symbols…",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--symbols", "${input:symbols}"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Login to Robinhood",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": ["--login"],
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "symbols",
+      "type": "promptString",
+      "description": "Tickers, space-separated",
+      "default": "AAPL MSFT NVDA META KO"
+    }
+  ]
+}
