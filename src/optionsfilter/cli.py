@@ -6,12 +6,21 @@ import argparse
 import asyncio
 import csv
 import sys
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 from optionsfilter.auth import FileTokenStorage
 from optionsfilter.client import RobinhoodMCP
-from optionsfilter.rules import Pick, Rules
+from optionsfilter.rules import BUY_CALL, BUY_PUT, MODES, SELL_CALL, SELL_PUT, Pick, Rules
 from optionsfilter.screener import screen
+
+
+RULE_SUMMARY = {
+    SELL_PUT: "IV rank > 50, |delta| 15–30, no earnings before expiry",
+    SELL_CALL: "IV rank > 50, delta 15–30, no earnings; COVERED ONLY, watch ex-dividend dates",
+    BUY_CALL: "IV rank < 30, IV30 < HV30, delta ~50; bullish thesis that fits inside 30 days",
+    BUY_PUT: "IV rank < 30, IV30 < HV30, delta ~50; bearish thesis that fits inside 30 days",
+}
 
 
 def pct(x: float | None, digits: int = 0) -> str:
@@ -24,11 +33,11 @@ def row(n: int, p: Pick) -> dict[str, str]:
         "#": str(n),
         "Symbol": s.symbol,
         "Price": f"{s.price:,.2f}",
-        "Strategy": p.strategy,
         "IVR": pct(s.ivr),
         "IV30": pct(s.iv30),
         "HV30": pct(s.hv30),
         "IV-HV": "-" if s.iv_hv is None else f"{s.iv_hv * 100:+.0f}",
+        "Trend": s.trend,
         "Earnings": f"{s.earnings:%m-%d}" if s.earnings else "-",
         "Expiry": f"{c.expiration[5:]} ({c.dte}d)" if c else "-",
         "Strike": f"{c.strike:g}{c.type[0].upper()}" if c else "-",
@@ -42,6 +51,37 @@ def row(n: int, p: Pick) -> dict[str, str]:
     }
 
 
+def csv_row(n: int, p: Pick) -> dict:
+    """Raw numbers (fractions, not percents) so spreadsheets can sort and chart them."""
+    s, c = p.stock, p.contract
+    r4 = lambda x: None if x is None else round(x, 4)
+    return {
+        "rank": n, "status": "PASS" if p.passed else "near miss", "symbol": s.symbol, "name": s.name,
+        "price": s.price, "strategy": p.strategy, "iv_rank": r4(s.ivr), "iv30": r4(s.iv30), "hv30": r4(s.hv30),
+        "iv_minus_hv": r4(s.iv_hv), "sma50": s.sma50,
+        "vs_sma50": r4(s.price / s.sma50 - 1) if s.sma50 else None, "options_volume": s.options_volume,
+        "earnings_date": s.earnings.isoformat() if s.earnings else None,
+        "expiration": c.expiration if c else None, "dte": c.dte if c else None,
+        "type": c.type if c else None, "strike": c.strike if c else None,
+        "delta": c.delta if c else None, "theta": c.theta if c else None, "contract_iv": c.iv if c else None,
+        "bid": c.bid if c else None, "ask": c.ask if c else None, "mid": r4(c.mid) if c else None,
+        "spread_pct": r4(c.spread) if c else None, "open_interest": c.open_interest if c else None,
+        "contract_volume": c.volume if c else None,
+        "problems": "; ".join(p.problems), "notes": "; ".join(p.notes),
+    }
+
+
+def write_csv(path: Path, results: dict[str, list[Pick]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [csv_row(n, pk) for picks in results.values() for n, pk in enumerate(picks, 1)]
+    if not rows:
+        return
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
 def print_table(rows: list[dict[str, str]]) -> None:
     cols = list(rows[0])
     widths = {k: max(len(k), *(len(r[k]) for r in rows)) for k in cols}
@@ -53,17 +93,22 @@ def print_table(rows: list[dict[str, str]]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="optionsfilter", description=__doc__)
-    p.add_argument("--mode", choices=["all", "sell-put", "sell-call", "buy"], default="all",
-                   help="all = sell puts where IVR>50, buy where IVR<30 & IV30<HV30")
+    p.add_argument("--mode", choices=list(MODES), default="all",
+                   help="all = sell put + sell call (IVR>50) and buy call + buy put (IVR<30 & IV30<HV30)")
     p.add_argument("--symbols", nargs="+", help="screen these tickers instead of an index")
-    p.add_argument("--universe", nargs="+", default=["SP500", "NDX"], help="index codes, e.g. SP500 NDX SP100 Russell1000")
-    p.add_argument("--limit", type=int, default=15)
+    p.add_argument("--universe", nargs="+", default=["most-traded"],
+                   help="most-traded (top --top stocks by options volume), popular (Robinhood's 100 most "
+                        "popular), or index codes, e.g. SP500 NDX Russell1000")
+    p.add_argument("--top", type=int, default=100, help="size of the most-traded universe")
+    p.add_argument("--etfs", action="store_true", help="most-traded: include ETFs (SPY, QQQ, IWM...)")
+    p.add_argument("--limit", type=int, default=15, help="rows per strategy")
     p.add_argument("--min-dte", type=int, default=30)
     p.add_argument("--max-dte", type=int, default=45)
     p.add_argument("--min-oi", type=int, default=1000, help="contract open interest")
     p.add_argument("--max-spread", type=float, default=0.02, help="bid/ask spread as fraction of mid")
     p.add_argument("--min-options-volume", type=int, default=10_000, help="underlying daily options volume")
-    p.add_argument("--csv", help="also write the table to this CSV file")
+    p.add_argument("--csv", help="CSV path (default: results/optionsfilter_<mode>_<date>_<time>.csv)")
+    p.add_argument("--no-csv", action="store_true", help="don't save a CSV")
     p.add_argument("--login", action="store_true", help="authorize with Robinhood and exit")
     p.add_argument("--logout", action="store_true", help="delete cached tokens and exit")
     args = p.parse_args(argv)
@@ -83,22 +128,26 @@ def main(argv: list[str] | None = None) -> None:
             if args.login:
                 print(f"Authorized. Tokens cached at {rh.storage.path}")
                 return
-            print(f"Screening {' '.join(args.symbols or args.universe)} for {args.min_dte}–{args.max_dte} DTE "
+            label = ' '.join(args.symbols or args.universe)
+            if not args.symbols and args.universe == ["most-traded"]:
+                label = f"top {args.top} most-traded {'stocks+ETFs' if args.etfs else 'stocks'} (by options volume)"
+            print(f"Screening {label} for {args.min_dte}–{args.max_dte} DTE "
                   f"({args.mode})...", file=sys.stderr)
-            picks, stats = await screen(rh, rules, args.mode, args.universe, args.symbols, args.limit)
+            results, stats = await screen(rh, rules, args.mode, args.universe, args.symbols, args.limit,
+                                        top=args.top, etfs=args.etfs)
 
-        if not picks:
-            print("Nothing matched.")
-        else:
-            rows = [row(n, pk) for n, pk in enumerate(picks, 1)]
-            print(f"\nAs of {date.today()} — PASS rows meet every rule; the rest are the closest near misses.\n")
-            print_table(rows)
-            if args.csv:
-                with open(args.csv, "w", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-                    w.writeheader()
-                    w.writerows(rows)
-                print(f"\nWrote {args.csv}", file=sys.stderr)
+        print(f"\nAs of {date.today()} — PASS rows meet every rule; the rest are the closest near misses.")
+        for strategy, picks in results.items():
+            print(f"\n=== {strategy} — {RULE_SUMMARY[strategy]}\n")
+            if picks:
+                print_table([row(n, pk) for n, pk in enumerate(picks, 1)])
+            else:
+                print("  no stocks qualify today")
+        total = sum(len(v) for v in results.values())
+        if total and not args.no_csv:
+            path = Path(args.csv or f"results/optionsfilter_{args.mode}_{datetime.now():%Y-%m-%d_%H%M}.csv")
+            write_csv(path, results)
+            print(f"\nSaved {total} rows to {path.resolve()}")
         print("\nFunnel:", ", ".join(f"{k} {v}" for k, v in stats.items()))
         print("Not automated: whether the strike is a support level you'd be happy to own shares at.")
 

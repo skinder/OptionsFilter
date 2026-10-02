@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import AsyncExitStack
@@ -44,17 +45,32 @@ class RobinhoodMCP:
     async def call(self, tool: str, **args: Any) -> dict:
         if not is_read_only(tool):
             raise PermissionError(f"read-only client: refusing '{tool}'")
-        result = await self._session.call_tool(tool, {k: v for k, v in args.items() if v is not None})
-        payload = result.structured_content or _json_text(result)
-        if result.is_error:
-            raise RuntimeError(f"{tool} failed: {payload}")
-        return payload.get("data", payload)
+        args = {k: v for k, v in args.items() if v is not None}
+        for wait in (5, 15, 30, 60, None):  # back off on rate limits
+            result = await self._session.call_tool(tool, args)
+            payload = result.structured_content or _json_text(result)
+            if not result.is_error:
+                return payload.get("data", payload)
+            if wait is None or "rate limit" not in str(payload).lower():
+                raise RuntimeError(f"{tool} failed: {payload}")
+            print(f"  rate-limited on {tool}, retrying in {wait}s...")
+            await asyncio.sleep(wait)
 
     # --- the handful of calls the screener needs -----------------------------------
 
-    async def scan(self, filters: list[dict], columns: list[dict]) -> list[dict]:
+    async def scan(self, filters: list[dict], columns: list[dict]) -> tuple[list[dict], int]:
+        """(rows, total_items). The server returns at most 200 rows, sorted by price."""
         data = await self.call("preview_scan", filters=filters, columns=columns)
-        return data["result"]["results"]
+        return data["result"]["results"], data["result"]["total_items"]
+
+    async def curated_list(self, name: str) -> list[str]:
+        """Tickers in a Robinhood-curated list such as '100 most popular'."""
+        lists = (await self.call("get_popular_watchlists"))["lists"]
+        match = next((l for l in lists if l["display_name"].lower() == name.lower()), None)
+        if not match:
+            raise ValueError(f"No Robinhood list named {name!r}; have: {[l['display_name'] for l in lists]}")
+        items = (await self.call("get_watchlist_items", list_id=match["id"]))["items"]
+        return [i["symbol"] for i in items if i.get("object_type") == "instrument"]
 
     async def option_chains(self, symbol: str) -> list[dict]:
         return (await self.call("get_option_chains", underlying_symbol=symbol))["chains"]

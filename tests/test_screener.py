@@ -3,8 +3,8 @@ from datetime import date
 
 from optionsfilter.client import is_read_only
 from optionsfilter.rules import (
-    BUY, SELL_CALL, SELL_PUT, Contract, Rules, Stock, best_contract, candidate_expirations, next_ex_div,
-    stock_from_scan, strategy_for, ymd,
+    BUY_CALL, BUY_PUT, SELL_CALL, SELL_PUT, Contract, Rules, Stock, best_contract, candidate_expirations, next_ex_div,
+    stock_from_scan, strategies_for, ymd,
 )
 from optionsfilter.screener import screen
 
@@ -39,12 +39,19 @@ def test_scan_row_parsing():
 # --- stock-level rules ---------------------------------------------------------------
 
 def test_strategy_selection():
-    assert strategy_for(stock(ivr=0.55), RULES, "all") == SELL_PUT
-    assert strategy_for(stock(ivr=0.55), RULES, "sell-call") == SELL_CALL
-    assert strategy_for(stock(ivr=0.20, iv30=0.25, hv30=0.30), RULES, "all") == BUY
-    assert strategy_for(stock(ivr=0.20, iv30=0.35, hv30=0.30), RULES, "all") is None  # IV above HV
-    assert strategy_for(stock(ivr=0.40), RULES, "all") is None  # no edge
-    assert strategy_for(stock(ivr=0.55), RULES, "buy") is None
+    assert strategies_for(stock(ivr=0.55), RULES) == [SELL_PUT, SELL_CALL]
+    assert strategies_for(stock(ivr=0.55), RULES, "sell-call") == [SELL_CALL]
+    assert strategies_for(stock(ivr=0.20, iv30=0.25, hv30=0.30), RULES) == [BUY_CALL, BUY_PUT]
+    assert strategies_for(stock(ivr=0.20, iv30=0.25, hv30=0.30), RULES, "buy-put") == [BUY_PUT]
+    assert strategies_for(stock(ivr=0.20, iv30=0.35, hv30=0.30), RULES) == []  # IV above HV
+    assert strategies_for(stock(ivr=0.40), RULES) == []  # no edge
+    assert strategies_for(stock(ivr=0.55), RULES, "buy") == []
+
+
+def test_trend_hint():
+    assert stock(price=110.0, sma50=100.0).trend == "up +10%"
+    assert stock(price=90.0, sma50=100.0).trend == "down -10%"
+    assert stock().trend == "-"
 
 
 def test_seller_picks_expiry_before_earnings():
@@ -55,7 +62,7 @@ def test_seller_picks_expiry_before_earnings():
     s = stock(earnings=date(2026, 10, 20))
     assert candidate_expirations(exps, s, SELL_PUT, RULES, TODAY) == (["2026-10-30", "2026-11-06"], True)
     assert candidate_expirations(["2026-10-16"], s, SELL_PUT, RULES, TODAY) == ([], False)
-    assert candidate_expirations(exps, stock(earnings=None), BUY, RULES, TODAY) == (["2026-10-30", "2026-11-06"], False)
+    assert candidate_expirations(exps, stock(earnings=None), BUY_CALL, RULES, TODAY) == (["2026-10-30", "2026-11-06"], False)
 
 
 def test_ex_div_projection():
@@ -104,23 +111,25 @@ class FakeRH:
         ]
 
     async def scan(self, filters, columns):
-        return self.scan_rows
+        return self.scan_rows, len(self.scan_rows)
 
     async def option_chains(self, symbol):
+        self.chains_requested = getattr(self, "chains_requested", []) + [symbol]
         return [{"id": f"chain-{symbol}", "symbol": symbol,
                  "expiration_dates": ["2026-10-16", "2026-10-30", "2026-11-06"]}]
 
     async def option_instruments(self, chain_id, expiration, option_type):
         sym = chain_id.split("-")[1]
-        return [{"id": f"{sym}-{k}", "chain_symbol": sym, "expiration_date": expiration,
-                 "strike_price": str(k), "type": option_type} for k in (90, 95, 100)]
+        return [{"id": f"{sym}-{k}-{option_type}-{expiration}", "chain_symbol": sym, "expiration_date": expiration,
+                 "strike_price": str(k), "type": option_type} for k in (90, 95, 100, 105, 110)]
 
     async def option_quotes(self, ids):
-        delta = {"90": "-0.18", "95": "-0.30", "100": "-0.50"}
+        put = {"90": "-0.18", "95": "-0.30", "100": "-0.50", "105": "-0.70", "110": "-0.82"}
+        call = {"90": "0.82", "95": "0.70", "100": "0.50", "105": "0.30", "110": "0.18"}
         out = {}
         for i in ids:
-            sym, k = i.split("-")
-            d = delta[k] if sym != "CHEAP" else {"90": "0.80", "95": "0.65", "100": "0.50"}[k]
+            sym, k, typ = i.split("-")[:3]
+            d = (put if typ == "put" else call)[k]
             out[i] = {"instrument_id": i, "delta": d, "theta": "-0.04", "implied_volatility": "0.4",
                       "bid_price": "2.00", "ask_price": "2.02", "open_interest": 4000, "volume": 300}
         return out
@@ -133,12 +142,93 @@ def _scan(sym, ivr, earnings="", iv="0.40", hv="0.35"):
 
 
 def test_screen_end_to_end():
-    picks, stats = asyncio.run(screen(FakeRH(), RULES, today=TODAY))
-    by_symbol = {p.stock.symbol: p for p in picks}
-    assert by_symbol["GOOD"].passed and by_symbol["GOOD"].strategy == SELL_PUT
-    assert by_symbol["GOOD"].contract.strike == 90 and by_symbol["GOOD"].contract.expiration == "2026-10-30"
-    assert by_symbol["CHEAP"].passed and by_symbol["CHEAP"].strategy == BUY
-    assert not by_symbol["EARN"].passed and "earnings" in by_symbol["EARN"].problems[0]
-    assert "MEH" not in by_symbol
-    assert [p.stock.symbol for p in picks][-1] == "EARN"  # passes listed before near misses
-    assert stats["passed"] == 2
+    rh = FakeRH()
+    results, stats = asyncio.run(screen(rh, RULES, today=TODAY))
+    assert list(results) == [SELL_PUT, SELL_CALL, BUY_CALL, BUY_PUT]
+    sp = {p.stock.symbol: p for p in results[SELL_PUT]}
+    sc = {p.stock.symbol: p for p in results[SELL_CALL]}
+    bc = {p.stock.symbol: p for p in results[BUY_CALL]}
+    bp = {p.stock.symbol: p for p in results[BUY_PUT]}
+    assert sp["GOOD"].passed and sp["GOOD"].contract.strike == 90 and sp["GOOD"].contract.type == "put"
+    assert sc["GOOD"].passed and sc["GOOD"].contract.strike == 110 and sc["GOOD"].contract.type == "call"
+    assert "covered only" in sc["GOOD"].notes
+    assert bc["CHEAP"].passed and bc["CHEAP"].contract.delta == 0.50
+    assert bp["CHEAP"].passed and bp["CHEAP"].contract.delta == -0.50
+    assert not sp["EARN"].passed and "earnings" in sp["EARN"].problems[0]
+    assert "MEH" not in sp and "CHEAP" not in sp and "GOOD" not in bc
+    assert [p.stock.symbol for p in results[SELL_PUT]][-1] == "EARN"  # passes before near misses
+    assert stats["sell put passed"] == 1 and stats["buy put passed"] == 1
+    assert sorted(rh.chains_requested) == ["CHEAP", "EARN", "GOOD"]  # one chain lookup per symbol
+
+
+def test_csv_export(tmp_path):
+    import csv as _csv
+    from optionsfilter.cli import write_csv
+    results, _ = asyncio.run(screen(FakeRH(), RULES, today=TODAY))
+    path = tmp_path / "out" / "r.csv"
+    write_csv(path, results)
+    rows = list(_csv.DictReader(open(path)))
+    assert len(rows) == sum(len(v) for v in results.values())
+    assert {r["strategy"] for r in rows} == {"SELL PUT", "SELL CALL", "BUY CALL", "BUY PUT"}
+    good = next(r for r in rows if r["symbol"] == "GOOD" and r["strategy"] == "SELL PUT")
+    assert good["status"] == "PASS" and float(good["iv_rank"]) == 0.7 and float(good["delta"]) == -0.18
+    assert next(r for r in rows if r["symbol"] == "EARN")["problems"].startswith("earnings")
+
+
+def test_most_traded_takes_top_by_options_volume_and_splits_capped_scans():
+    from optionsfilter.screener import load_universe
+
+    class Capped:
+        def __init__(self):
+            self.calls = []
+
+        async def scan(self, filters, columns):
+            self.calls.append(filters)
+            price = [f for f in filters if f["expression"] == "tradeAllDay.price"]
+            if not price:  # unbanded: always capped; raising the floor leaves too few names
+                floor = int(next(f for f in filters if f["expression"] == "optionsTotalDayVolume")["values"][0])
+                return [], 300 if floor <= 10_000 else 2
+            lo = float(price[0]["values"][0])
+            rows = [{"ticker": f"S{lo:g}", "columns": {"Options volume": str(int(lo * 1000 + 1)), "Last": str(lo)}}]
+            return rows, 1
+
+    rh = Capped()
+    stocks = asyncio.run(load_universe(rh, RULES, ["most-traded"], None, top=3, etfs=False))
+    assert [s.symbol for s in stocks] == ["S600", "S250", "S100"]  # top 3 by options volume
+    assert len(rh.calls) == 2 + 7  # capped scan, overshooting higher floor, then one per price band
+    assert rh.calls[0][0]["values"] == ["Russell3000"]  # stocks only by default
+
+
+def test_popular_universe_uses_robinhood_list():
+    from optionsfilter.screener import load_universe
+
+    class Pop:
+        async def curated_list(self, name):
+            assert name == "100 most popular"
+            return ["AAPL", "SPY"]
+
+        async def scan(self, filters, columns):
+            assert filters[0] == {"expression": "symbol", "predicate": "PREDICATE_ANY_OF", "values": ["AAPL", "SPY"]}
+            return [], 0
+
+    assert asyncio.run(load_universe(Pop(), RULES, ["popular"], None, top=100, etfs=False)) == []
+
+
+def test_most_traded_raises_floor_when_that_fits_in_one_response():
+    from optionsfilter.screener import load_universe
+
+    class Fits:
+        def __init__(self):
+            self.calls = 0
+
+        async def scan(self, filters, columns):
+            self.calls += 1
+            floor = int(next(f for f in filters if f["expression"] == "optionsTotalDayVolume")["values"][0])
+            if floor <= 10_000:
+                return [], 368
+            rows = [{"ticker": f"T{i}", "columns": {"Options volume": str(100_000 - i)}} for i in range(150)]
+            return rows, 150
+
+    rh = Fits()
+    stocks = asyncio.run(load_universe(rh, RULES, ["most-traded"], None, top=100, etfs=True))
+    assert len(stocks) == 100 and stocks[0].symbol == "T0" and rh.calls == 2

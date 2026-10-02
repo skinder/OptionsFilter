@@ -2,7 +2,8 @@
 
   Sell put    IV rank > 50, |delta| 15–30, no earnings before expiry.
   Sell call   Same, covered only, flag ex-dividend before expiry (early assignment).
-  Buy         IV rank < 30 and IV30 < HV30 (direction = your thesis).
+  Buy call    IV rank < 30 and IV30 < HV30; direction = your thesis (trend vs 50-day SMA shown as a hint).
+  Buy put     Same as buy call, bearish side.
   Liquidity   underlying options volume > 10k/day, contract OI > 1k, bid/ask spread < 2% of mid.
 """
 
@@ -12,7 +13,18 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-SELL_PUT, SELL_CALL, BUY = "SELL PUT", "SELL CALL", "BUY"
+SELL_PUT, SELL_CALL, BUY_CALL, BUY_PUT = "SELL PUT", "SELL CALL", "BUY CALL", "BUY PUT"
+STRATEGIES = [SELL_PUT, SELL_CALL, BUY_CALL, BUY_PUT]
+BUYS = {BUY_CALL, BUY_PUT}
+MODES = {
+    "all": STRATEGIES,
+    "sell": [SELL_PUT, SELL_CALL],
+    "buy": [BUY_CALL, BUY_PUT],
+    "sell-put": [SELL_PUT],
+    "sell-call": [SELL_CALL],
+    "buy-call": [BUY_CALL],
+    "buy-put": [BUY_PUT],
+}
 
 
 @dataclass
@@ -41,10 +53,18 @@ class Stock:
     options_volume: int
     earnings: date | None
     last_ex_div: date | None
+    sma50: float | None = None
 
     @property
     def iv_hv(self) -> float | None:
         return None if self.iv30 is None or self.hv30 is None else self.iv30 - self.hv30
+
+    @property
+    def trend(self) -> str:
+        """Price vs its 50-day average — a hint for picking call vs put, not a signal."""
+        if not self.sma50 or not self.price:
+            return "-"
+        return f"{'up' if self.price >= self.sma50 else 'down'} {self.price / self.sma50 - 1:+.0%}"
 
 
 @dataclass
@@ -117,6 +137,7 @@ def stock_from_scan(row: dict) -> Stock:
         options_volume=int(num(c.get("Options volume")) or 0),
         earnings=ymd(c.get("Earnings date")),
         last_ex_div=ymd(c.get("Ex-dividend date")),
+        sma50=num(c.get("SMA50")),
     )
 
 
@@ -142,25 +163,23 @@ def contract_from(instrument: dict, quote: dict, today: date) -> Contract | None
 # --- stock-level rules --------------------------------------------------------------
 
 
-def strategy_for(stock: Stock, rules: Rules, mode: str) -> str | None:
-    """Which side of the framework this stock qualifies for (None = no edge)."""
+def strategies_for(stock: Stock, rules: Rules, mode: str = "all") -> list[str]:
+    """Every strategy (within `mode`) this stock's volatility qualifies it for; [] = no edge."""
     if stock.ivr is None:
-        return None
+        return []
     sell = stock.ivr >= rules.sell_min_ivr
     buy = stock.ivr <= rules.buy_max_ivr and stock.iv_hv is not None and stock.iv_hv < 0
-    if mode in ("all", "sell-put") and sell:
-        return SELL_PUT
-    if mode == "sell-call" and sell:
-        return SELL_CALL
-    if mode in ("all", "buy") and buy:
-        return BUY
-    return None
+    return [st for st in MODES[mode] if (sell and st not in BUYS) or (buy and st in BUYS)]
+
+
+def option_type(strategy: str) -> str:
+    return "put" if strategy in (SELL_PUT, BUY_PUT) else "call"
 
 
 def score(pick: Pick) -> float:
     """Sellers: higher IV rank is better. Buyers: IV further below HV is better."""
     s = pick.stock
-    return s.ivr if pick.strategy != BUY else -(s.iv_hv or 0)
+    return -(s.iv_hv or 0) if pick.strategy in BUYS else s.ivr
 
 
 def earnings_in_window(stock: Stock, expiration: date, today: date) -> bool:
@@ -190,7 +209,7 @@ def candidate_expirations(expirations: list[str], stock: Stock, strategy: str, r
     )
     if not window:
         return [], False
-    if strategy != BUY:
+    if strategy not in BUYS:
         clean = [d for d in window if not earnings_in_window(stock, date.fromisoformat(d), today)]
         if clean:
             return clean, False
@@ -212,7 +231,7 @@ def strike_band(stock: Stock, strategy: str, dte: int) -> tuple[float, float]:
 
 
 def delta_range(strategy: str, rules: Rules) -> tuple[tuple[float, float], float]:
-    if strategy == BUY:
+    if strategy in BUYS:
         return rules.buy_delta, rules.buy_target_delta
     return rules.sell_delta, rules.sell_target_delta
 

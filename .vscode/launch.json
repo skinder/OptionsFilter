@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Screener: all (sell puts + buys)",
+      "name": "Screener: top 100 most-traded (default)",
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
@@ -10,11 +10,47 @@
       "justMyCode": true
     },
     {
+      "name": "Screener: Robinhood 100 most popular",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": [
+        "--universe",
+        "popular"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: top 100 most-traded incl. ETFs",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": [
+        "--etfs"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Screener: S&P 500 + Nasdaq-100",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "optionsfilter",
+      "args": [
+        "--universe",
+        "SP500",
+        "NDX"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
       "name": "Screener: sell puts",
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--mode", "sell-put"],
+      "args": [
+        "--mode",
+        "sell-put"
+      ],
       "console": "integratedTerminal"
     },
     {
@@ -22,7 +58,10 @@
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--mode", "sell-call"],
+      "args": [
+        "--mode",
+        "sell-call"
+      ],
       "console": "integratedTerminal"
     },
     {
@@ -30,7 +69,10 @@
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--mode", "buy"],
+      "args": [
+        "--mode",
+        "buy"
+      ],
       "console": "integratedTerminal"
     },
     {
@@ -38,15 +80,23 @@
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--max-spread", "0.05", "--csv", "today.csv"],
+      "args": [
+        "--max-spread",
+        "0.05",
+        "--csv",
+        "today.csv"
+      ],
       "console": "integratedTerminal"
     },
     {
-      "name": "Screener: my symbols…",
+      "name": "Screener: my symbols\u2026",
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--symbols", "${input:symbols}"],
+      "args": [
+        "--symbols",
+        "${input:symbols}"
+      ],
       "console": "integratedTerminal"
     },
     {
@@ -54,7 +104,9 @@
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
-      "args": ["--login"],
+      "args": [
+        "--login"
+      ],
       "console": "integratedTerminal"
     }
   ],

@@ -1,4 +1,4 @@
-"""Pipeline: one scanner call for the universe → stock-level rules → best contract per stock."""
+"""Pipeline: scanner call(s) for the universe → stock-level rules → best contract per stock."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from datetime import date
 
 from optionsfilter.client import RobinhoodMCP
 from optionsfilter.rules import (
-    BUY, SELL_CALL, SELL_PUT, Pick, Rules, best_contract, candidate_expirations, contract_from,
-    next_ex_div, score, stock_from_scan, strategy_for, strike_band,
+    BUYS, MODES, SELL_CALL, Pick, Rules, Stock, best_contract, candidate_expirations, contract_from,
+    next_ex_div, option_type, score, stock_from_scan, strategies_for, strike_band,
 )
 
 SCAN_COLUMNS = [
@@ -18,8 +18,80 @@ SCAN_COLUMNS = [
     {"display_name": "HV30", "expression": "statVol1Month"},  # shown as "Historical volatility"
     {"display_name": "Earnings date", "expression": "fundamental.earningsYmd"},
     {"display_name": "Ex-dividend date", "expression": "fundamental.exYmd"},
+    {"display_name": "SMA50", "expression": 'closeAvg(candleCount=50, candlePeriod="1d", session="all")'},
 ]
 CONCURRENCY = 6
+SCAN_CAP = 200  # rows per scanner response
+PRICE_BANDS = [(0, 10), (10, 25), (25, 50), (50, 100), (100, 250), (250, 600), (600, None)]
+
+MOST_TRADED, POPULAR = "most-traded", "popular"
+POPULAR_LIST = "100 most popular"
+
+
+def _f(expression: str, predicate: str, values: list) -> dict:
+    return {"expression": expression, "predicate": f"PREDICATE_{predicate}", "values": [str(v) for v in values]}
+
+
+async def scan_all(rh: RobinhoodMCP, filters: list[dict]) -> list[dict]:
+    """Scanner rows for `filters`, splitting by price band when the response is capped."""
+    rows, total = await rh.scan(filters, SCAN_COLUMNS)
+    return rows if len(rows) >= total else await scan_bands(rh, filters)
+
+
+async def scan_bands(rh: RobinhoodMCP, filters: list[dict]) -> list[dict]:
+    by_ticker: dict[str, dict] = {}
+    for lo, hi in PRICE_BANDS:
+        band = [_f("tradeAllDay.price", "GREATER_THAN_OR_EQUAL", [lo])]
+        if hi is not None:
+            band.append(_f("tradeAllDay.price", "LESS_THAN", [hi]))
+        band_rows, band_total = await rh.scan(filters + band, SCAN_COLUMNS)
+        if len(band_rows) < band_total:
+            print(f"warning: price band {lo}-{hi} truncated ({len(band_rows)}/{band_total})")
+        by_ticker.update({r["ticker"]: r for r in band_rows})
+    return list(by_ticker.values())
+
+
+async def load_universe(
+    rh: RobinhoodMCP, rules: Rules, universe: list[str], symbols: list[str] | None, top: int, etfs: bool
+) -> list[Stock]:
+    """Stocks to screen, each already carrying IV rank / IV30 / HV30 / earnings from the scanner.
+
+    universe: ["most-traded"] top-N by options volume, ["popular"] Robinhood's 100 most popular,
+    or index codes like ["SP500", "NDX"]. `symbols` overrides it.
+    """
+    liquid = _f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [rules.min_options_volume])
+    if symbols or universe == [POPULAR]:
+        tickers = [s.upper() for s in symbols] if symbols else await rh.curated_list(POPULAR_LIST)
+        scope = [_f("symbol", "ANY_OF", tickers)]
+    elif universe == [MOST_TRADED]:
+        scope = [] if etfs else [_f("symbol", "IN_LIST", ["Russell3000"])]
+    else:
+        scope = [_f("symbol", "IN_LIST", universe)]
+
+    if universe == [MOST_TRADED] and not symbols:
+        rows = await scan_top(rh, scope, rules.min_options_volume, top)
+        stocks = [stock_from_scan(r) for r in rows]
+        return sorted(stocks, key=lambda s: s.options_volume, reverse=True)[:top]
+    return [stock_from_scan(r) for r in await scan_all(rh, scope + [liquid])]
+
+
+async def scan_top(rh: RobinhoodMCP, scope: list[dict], min_volume: int, top: int) -> list[dict]:
+    """Rows covering the `top` names by options volume, in as few scanner calls as possible:
+    raise the volume floor until everything fits in one response (the scanner is rate-limited)."""
+    floor = min_volume
+    while True:
+        rows, total = await rh.scan(scope + [_f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [floor])], SCAN_COLUMNS)
+        if len(rows) >= total:
+            return rows
+        higher = int(floor * 2)
+        rows_hi, total_hi = await rh.scan(
+            scope + [_f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [higher])], SCAN_COLUMNS
+        )
+        if total_hi < top:  # overshot: split the lower floor by price instead
+            return await scan_bands(rh, scope + [_f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [floor])])
+        if len(rows_hi) >= total_hi:
+            return rows_hi
+        floor = higher
 
 
 async def screen(
@@ -29,56 +101,56 @@ async def screen(
     universe: list[str] | None = None,
     symbols: list[str] | None = None,
     limit: int = 15,
-    max_evaluate: int = 60,
+    top: int = 100,
+    etfs: bool = False,
+    max_evaluate: int = 40,
     today: date | None = None,
-) -> tuple[list[Pick], Counter]:
+) -> tuple[dict[str, list[Pick]], Counter]:
+    """Returns {strategy: up to `limit` picks (passes first, then near misses)} and a funnel."""
     today = today or date.today()
     stats: Counter = Counter()
 
-    scope = (
-        {"expression": "symbol", "predicate": "PREDICATE_ANY_OF", "values": [s.upper() for s in symbols]}
-        if symbols
-        else {"expression": "symbol", "predicate": "PREDICATE_IN_LIST", "values": universe or ["SP500", "NDX"]}
-    )
-    liquid = {"expression": "optionsTotalDayVolume", "predicate": "PREDICATE_GREATER_THAN_OR_EQUAL",
-              "values": [str(rules.min_options_volume)]}
-    stocks = [stock_from_scan(r) for r in await rh.scan([scope, liquid], SCAN_COLUMNS)]
+    stocks = await load_universe(rh, rules, universe or [MOST_TRADED], symbols, top, etfs)
     stats["scanned (options volume ok)"] = len(stocks)
 
-    candidates = []
+    candidates: dict[str, list[Pick]] = {st: [] for st in MODES[mode]}
     for s in stocks:
-        strategy = strategy_for(s, rules, mode)
-        if strategy:
-            candidates.append(Pick(s, strategy))
-        else:
+        strategies = strategies_for(s, rules, mode)
+        if not strategies:
             stats["no IV edge (IVR between buy/sell thresholds)"] += 1
-    candidates.sort(key=score, reverse=True)
+        for st in strategies:
+            candidates[st].append(Pick(s, st))
 
-    evaluated: list[Pick] = []
     sem = asyncio.Semaphore(CONCURRENCY)
+    chains: dict[str, asyncio.Task] = {}  # one chain lookup per symbol, shared across strategies
 
     async def run(p: Pick) -> Pick:
         async with sem:
             try:
-                await evaluate(rh, p, rules, today)
+                await evaluate(rh, p, rules, today, chains)
             except Exception as e:  # one bad symbol shouldn't sink the run
                 p.problems.append(f"error: {e}")
             return p
 
-    # Evaluate in batches until we have `limit` passes or hit max_evaluate.
-    queue = candidates[:max_evaluate]
-    while queue and sum(p.passed for p in evaluated) < limit:
-        batch, queue = queue[:CONCURRENCY], queue[CONCURRENCY:]
-        evaluated += await asyncio.gather(*(run(p) for p in batch))
+    async def run_strategy(strategy: str) -> list[Pick]:
+        """Best candidates first, in batches, until `limit` pass or `max_evaluate` are checked."""
+        queue = sorted(candidates[strategy], key=score, reverse=True)[:max_evaluate]
+        evaluated: list[Pick] = []
+        while queue and sum(p.passed for p in evaluated) < limit:
+            batch, queue = queue[:CONCURRENCY], queue[CONCURRENCY:]
+            evaluated += await asyncio.gather(*(run(p) for p in batch))
+        return evaluated
 
-    for p in evaluated:
-        for problem in p.problems:
-            stats["rejected: " + _reason(problem, rules)] += 1
-    passed = [p for p in evaluated if p.passed]
-    near = [p for p in evaluated if not p.passed and p.contract]
-    stats["passed"] = len(passed)
-    # Passes first; fill the list with the best near misses so you always see `limit` names.
-    return (passed + near)[:limit], stats
+    results: dict[str, list[Pick]] = {}
+    for strategy, evaluated in zip(candidates, await asyncio.gather(*(run_strategy(st) for st in candidates))):
+        for p in evaluated:
+            for problem in p.problems:
+                stats["rejected: " + _reason(problem, rules)] += 1
+        passed = [p for p in evaluated if p.passed]
+        near = [p for p in evaluated if not p.passed and p.contract]
+        stats[f"{strategy.lower()} passed"] = len(passed)
+        results[strategy] = (passed + near)[:limit]
+    return results, stats
 
 
 def _reason(problem: str, rules: Rules) -> str:
@@ -94,9 +166,13 @@ def _reason(problem: str, rules: Rules) -> str:
     return problem
 
 
-async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date) -> None:
+async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date, cache: dict | None = None) -> None:
     s, strategy = pick.stock, pick.strategy
-    chains = [c for c in await rh.option_chains(s.symbol) if c["symbol"] == s.symbol] or await rh.option_chains(s.symbol)
+    cache = {} if cache is None else cache
+    if s.symbol not in cache:
+        cache[s.symbol] = asyncio.ensure_future(rh.option_chains(s.symbol))
+    all_chains = await cache[s.symbol]
+    chains = [c for c in all_chains if c["symbol"] == s.symbol] or all_chains
     if not chains:
         pick.problems.append("no option chain")
         return
@@ -108,14 +184,13 @@ async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date) -> N
         return
     if earnings_hit:
         msg = f"earnings {s.earnings:%m-%d} before expiry"
-        (pick.notes if strategy == BUY else pick.problems).append(msg)
+        (pick.notes if strategy in BUYS else pick.problems).append(msg)
 
-    option_type = "put" if strategy == SELL_PUT else "call"
     instruments = []
     for expiration in expirations:
         lo, hi = strike_band(s, strategy, (date.fromisoformat(expiration) - today).days)
         instruments += [
-            i for i in await rh.option_instruments(chain["id"], expiration, option_type)
+            i for i in await rh.option_instruments(chain["id"], expiration, option_type(strategy))
             if lo <= float(i["strike_price"]) <= hi
         ]
     quotes = await rh.option_quotes([i["id"] for i in instruments])
@@ -129,5 +204,5 @@ async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date) -> N
         ex, estimated = next_ex_div(s, today)
         if ex and ex <= date.fromisoformat(expiration):
             pick.notes.append(f"ex-div {ex:%m-%d}{' (est.)' if estimated else ''} before expiry: early-assignment risk")
-    if strategy == BUY:
-        pick.notes.append("call or put = your thesis; must play out inside 30 days")
+    if strategy in BUYS:
+        pick.notes.append("needs a thesis that plays out inside 30 days")
