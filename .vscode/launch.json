@@ -2,45 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Screener: top 100 most-traded (default)",
+      "name": "Screener: all strategies (default universe)",
       "type": "debugpy",
       "request": "launch",
       "module": "optionsfilter",
       "console": "integratedTerminal",
       "justMyCode": true
-    },
-    {
-      "name": "Screener: Robinhood 100 most popular",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "optionsfilter",
-      "args": [
-        "--universe",
-        "popular"
-      ],
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Screener: top 100 most-traded incl. ETFs",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "optionsfilter",
-      "args": [
-        "--etfs"
-      ],
-      "console": "integratedTerminal"
-    },
-    {
-      "name": "Screener: S&P 500 + Nasdaq-100",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "optionsfilter",
-      "args": [
-        "--universe",
-        "SP500",
-        "NDX"
-      ],
-      "console": "integratedTerminal"
     },
     {
       "name": "Screener: sell puts",

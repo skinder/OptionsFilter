@@ -87,7 +87,7 @@ def test_best_contract_picks_liquid_expiry_over_newest_weekly():
 
 
 def test_best_contract_reports_liquidity_failures():
-    c, problems = best_contract([contract(-0.21, oi=200, bid=1.0, ask=1.1)], SELL_PUT, RULES)
+    c, problems = best_contract([contract(-0.21, oi=50, bid=1.0, ask=1.1)], SELL_PUT, RULES)
     assert c.delta == -0.21
     assert any(p.startswith("OI") for p in problems) and any(p.startswith("spread") for p in problems)
     c, problems = best_contract([contract(-0.05)], SELL_PUT, RULES)
@@ -112,6 +112,9 @@ class FakeRH:
 
     async def scan(self, filters, columns):
         return self.scan_rows, len(self.scan_rows)
+
+    async def curated_list(self, name):
+        return [r["ticker"] for r in self.scan_rows]
 
     async def option_chains(self, symbol):
         self.chains_requested = getattr(self, "chains_requested", []) + [symbol]
@@ -175,60 +178,72 @@ def test_csv_export(tmp_path):
     assert next(r for r in rows if r["symbol"] == "EARN")["problems"].startswith("earnings")
 
 
-def test_most_traded_takes_top_by_options_volume_and_splits_capped_scans():
-    from optionsfilter.screener import load_universe
+class UniverseRH:
+    """Scanner fake: 300 liquid names (S0..S299, plus ETFs E0..E9 when unscoped), popular list P0..P4."""
 
-    class Capped:
-        def __init__(self):
-            self.calls = []
+    def __init__(self):
+        self.calls = []
 
-        async def scan(self, filters, columns):
-            self.calls.append(filters)
-            price = [f for f in filters if f["expression"] == "tradeAllDay.price"]
-            if not price:  # unbanded: always capped; raising the floor leaves too few names
-                floor = int(next(f for f in filters if f["expression"] == "optionsTotalDayVolume")["values"][0])
-                return [], 300 if floor <= 10_000 else 2
+    @staticmethod
+    def _row(t, vol, price=50):
+        return {"ticker": t, "columns": {"Options volume": str(vol), "Last": str(price)}}
+
+    async def curated_list(self, name):
+        assert name == "100 most popular"
+        return ["P0", "P1", "P2", "P3", "P4", "S0", "E0"]
+
+    async def scan(self, filters, columns):
+        self.calls.append(filters)
+        sym = next((f for f in filters if f["expression"] == "symbol"), None)
+        if sym and sym["predicate"] == "PREDICATE_ANY_OF":  # popular list: no volume floor applied
+            assert not any(f["expression"] == "optionsTotalDayVolume" for f in filters)
+            rows = [self._row(t, 5 if t.startswith("P") else 1) for t in sym["values"]]
+            return rows, len(rows)
+        floor = int(next(f for f in filters if f["expression"] == "optionsTotalDayVolume")["values"][0])
+        universe = [self._row(f"S{i}", 1_000_000 - i * 1000, price=1 + i) for i in range(300)]
+        if sym is None:  # unscoped: ETFs too, and they trade the most
+            universe += [self._row(f"E{i}", 5_000_000 - i, price=400) for i in range(10)]
+        rows = [r for r in universe if int(r["columns"]["Options volume"]) >= floor]
+        price = [f for f in filters if f["expression"] == "tradeAllDay.price"]
+        if price:
             lo = float(price[0]["values"][0])
-            rows = [{"ticker": f"S{lo:g}", "columns": {"Options volume": str(int(lo * 1000 + 1)), "Last": str(lo)}}]
-            return rows, 1
-
-    rh = Capped()
-    stocks = asyncio.run(load_universe(rh, RULES, ["most-traded"], None, top=3, etfs=False))
-    assert [s.symbol for s in stocks] == ["S600", "S250", "S100"]  # top 3 by options volume
-    assert len(rh.calls) == 2 + 7  # capped scan, overshooting higher floor, then one per price band
-    assert rh.calls[0][0]["values"] == ["Russell3000"]  # stocks only by default
+            hi = float(price[1]["values"][0]) if len(price) > 1 else float("inf")
+            rows = [r for r in rows if lo <= float(r["columns"]["Last"]) < hi]
+        return rows[:200], len(rows)  # server caps responses at 200
 
 
-def test_popular_universe_uses_robinhood_list():
+def test_universe_is_distinct_union_of_three_lists():
+    from optionsfilter.screener import POPULAR, TOP_ALL, TOP_STOCKS, load_universe
+
+    stocks = asyncio.run(load_universe(UniverseRH(), RULES))
+    by = {s.symbol: s for s in stocks}
+    assert len(by) == len(stocks)  # distinct
+    assert all(f"S{i}" in by for i in range(100))  # top 100 stocks
+    assert "S100" not in by or POPULAR in by["S100"].sources
+    assert all(f"E{i}" in by for i in range(10))  # ETFs from the incl-ETFs list
+    assert all(f"P{i}" in by for i in range(5))  # popular kept despite tiny options volume
+    assert by["S0"].sources == [TOP_STOCKS, TOP_ALL, POPULAR]
+    assert by["E0"].sources == [TOP_ALL, POPULAR]
+    assert by["P0"].sources == [POPULAR]
+    assert len(stocks) == 100 + 10 + 5  # 90 stocks overlap between the two top-100 lists
+
+
+def test_capped_scans_are_split_by_price_not_dropped():
+    from optionsfilter.screener import scan_bands, _f
+
+    rows = asyncio.run(scan_bands(UniverseRH(), [_f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [10_000])]))
+    assert len(rows) == 310  # 300 stocks + 10 ETFs > 200 cap, all recovered across price bands
+
+
+def test_symbols_override():
     from optionsfilter.screener import load_universe
 
-    class Pop:
-        async def curated_list(self, name):
-            assert name == "100 most popular"
-            return ["AAPL", "SPY"]
-
-        async def scan(self, filters, columns):
-            assert filters[0] == {"expression": "symbol", "predicate": "PREDICATE_ANY_OF", "values": ["AAPL", "SPY"]}
-            return [], 0
-
-    assert asyncio.run(load_universe(Pop(), RULES, ["popular"], None, top=100, etfs=False)) == []
+    rh = UniverseRH()
+    stocks = asyncio.run(load_universe(rh, RULES, ["p0", "S0"]))
+    assert {s.symbol for s in stocks} == {"P0", "S0"} and len(rh.calls) == 1
 
 
-def test_most_traded_raises_floor_when_that_fits_in_one_response():
-    from optionsfilter.screener import load_universe
+def test_share_class_tickers_use_slash_for_scanner():
+    from optionsfilter.screener import _tickers
 
-    class Fits:
-        def __init__(self):
-            self.calls = 0
-
-        async def scan(self, filters, columns):
-            self.calls += 1
-            floor = int(next(f for f in filters if f["expression"] == "optionsTotalDayVolume")["values"][0])
-            if floor <= 10_000:
-                return [], 368
-            rows = [{"ticker": f"T{i}", "columns": {"Options volume": str(100_000 - i)}} for i in range(150)]
-            return rows, 150
-
-    rh = Fits()
-    stocks = asyncio.run(load_universe(rh, RULES, ["most-traded"], None, top=100, etfs=True))
-    assert len(stocks) == 100 and stocks[0].symbol == "T0" and rh.calls == 2
+    assert _tickers(["brk.b", "AAPL"])["values"] == ["BRK/B", "AAPL"]

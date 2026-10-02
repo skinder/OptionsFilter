@@ -4,7 +4,7 @@
   Sell call   Same, covered only, flag ex-dividend before expiry (early assignment).
   Buy call    IV rank < 30 and IV30 < HV30; direction = your thesis (trend vs 50-day SMA shown as a hint).
   Buy put     Same as buy call, bearish side.
-  Liquidity   underlying options volume > 10k/day, contract OI > 1k, bid/ask spread < 2% of mid.
+  Liquidity   underlying options volume > 10k/day, contract OI ≥ 100, bid/ask spread < 2% of mid.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ class Rules:
     sell_target_delta: float = 0.22
     buy_delta: tuple[float, float] = (0.40, 0.60)
     buy_target_delta: float = 0.50
-    min_options_volume: int = 10_000  # underlying, all contracts, per day
-    min_open_interest: int = 1_000  # the chosen contract
+    min_options_volume: int = 10_000  # starting floor for the top-100 scans (the 100th name trades far more)
+    min_open_interest: int = 100  # the chosen contract
     max_spread: float = 0.02  # (ask - bid) / mid
 
 
@@ -54,6 +54,7 @@ class Stock:
     earnings: date | None
     last_ex_div: date | None
     sma50: float | None = None
+    sources: list[str] = field(default_factory=list)  # which universe lists it came from
 
     @property
     def iv_hv(self) -> float | None:

@@ -8,7 +8,14 @@ Screens for **15 stocks that fit the 1-month (30–45 DTE) options framework** u
 | **Sell call** | Same, covered only, plus an ex-dividend-before-expiry flag (early assignment) |
 | **Buy call** | IV rank < 30 and IV30 < HV30, delta ~0.50, a bullish thesis that plays out within 30 days |
 | **Buy put** | Same as buy call, for the bearish side. The Trend column (price vs its 50-day average) is a hint for choosing between them, not a signal |
-| **Liquidity** | Underlying options volume > 10k/day, contract OI > 1k, bid/ask spread < 2% of mid |
+| **Liquidity** | Contract open interest ≥ 100, bid/ask spread < 2% of mid |
+
+**Universe:** a distinct list built from three sources (about 190 names today):
+1. the top 100 stocks by today's options volume
+2. the top 100 stocks and ETFs by today's options volume (adds SPY, QQQ, IWM, TLT, IBIT…)
+3. Robinhood's "100 most popular" list, kept whole with no volume minimum
+
+Nothing is dropped by price. The CSV's `lists` column shows which source(s) each name came from.
 
 ## Setup
 
@@ -20,23 +27,19 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ## Run
 
 ```bash
-.venv/bin/optionsfilter                          # top 100 most-traded stocks (by options volume), 15 results
-.venv/bin/optionsfilter --universe popular       # Robinhood's "100 most popular" list (includes ETFs)
-.venv/bin/optionsfilter --etfs                   # most-traded incl. ETFs (SPY, QQQ, IWM, TLT…)
-.venv/bin/optionsfilter --top 200                # widen the most-traded universe
-.venv/bin/optionsfilter --universe SP500 NDX     # index members instead
+.venv/bin/optionsfilter                          # all 4 strategies over the universe above
 .venv/bin/optionsfilter --mode sell              # sell put + sell call only
 .venv/bin/optionsfilter --mode buy               # buy call + buy put only
 .venv/bin/optionsfilter --mode sell-put          # or sell-call, buy-call, buy-put
-.venv/bin/optionsfilter --symbols AAPL KO XOM MRK NKE
+.venv/bin/optionsfilter --symbols AAPL KO BRK.B   # only these tickers
 .venv/bin/optionsfilter --csv today.csv
 ```
 
-The thresholds can be changed with `--min-dte --max-dte --min-oi --max-spread --min-options-volume --limit --universe`.
+The thresholds can be changed with `--min-dte --max-dte --min-oi --max-spread --limit`.
 
 ## How it works
 
-1. **Universe:** the top 100 Russell 3000 stocks by today's options volume (default), Robinhood's "100 most popular" list, or index members. The Robinhood scanner returns IV rank, IV30, HV30, earnings date and ex-dividend date for each stock with ≥ 10k options volume. Because the scanner caps each response at 200 rows and is rate-limited, the tool raises the volume floor or splits the scan by price range so it uses as few calls as possible, and backs off when it's rate-limited.
+1. **Universe:** the three lists above, merged and de-duplicated. A few Robinhood scanner calls return IV rank, IV30, HV30, the 50-day average, earnings and ex-dividend dates. The scanner caps each response at 200 rows sorted by price, so capped results are split by price range to keep every name. Calls are kept few and back off on rate limits.
 2. **Stock rules:** IV rank > 50 makes a stock a candidate for both sell put and sell call. IV rank < 30 with IV30 < HV30 makes it a candidate for both buy call and buy put. Anything in between has no edge and is dropped.
 3. **Expiry:** every expiry within 30–45 DTE is checked, because a newly listed weekly often has no open interest yet. Sellers only use expiries before earnings when there are any.
 4. **Contract:** from the chain, the tool takes the contract closest to delta 0.22 (0.50 for buys) that passes OI and spread. If none passes, it shows the closest one with the failures listed.

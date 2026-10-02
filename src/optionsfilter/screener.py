@@ -24,8 +24,15 @@ CONCURRENCY = 6
 SCAN_CAP = 200  # rows per scanner response
 PRICE_BANDS = [(0, 10), (10, 25), (25, 50), (50, 100), (100, 250), (250, 600), (600, None)]
 
-MOST_TRADED, POPULAR = "most-traded", "popular"
 POPULAR_LIST = "100 most popular"
+TOP_N = 100
+# Universe sources (tags shown in the CSV "lists" column)
+TOP_STOCKS, TOP_ALL, POPULAR = "top100-stocks", "top100-incl-etfs", "rh-popular"
+
+
+def _tickers(symbols: list[str]) -> dict:
+    """symbol ANY_OF filter. The scanner matches share classes as BRK/B (but returns BRK.B)."""
+    return _f("symbol", "ANY_OF", [t.upper().replace(".", "/") for t in symbols])
 
 
 def _f(expression: str, predicate: str, values: list) -> dict:
@@ -51,28 +58,34 @@ async def scan_bands(rh: RobinhoodMCP, filters: list[dict]) -> list[dict]:
     return list(by_ticker.values())
 
 
-async def load_universe(
-    rh: RobinhoodMCP, rules: Rules, universe: list[str], symbols: list[str] | None, top: int, etfs: bool
-) -> list[Stock]:
-    """Stocks to screen, each already carrying IV rank / IV30 / HV30 / earnings from the scanner.
+async def load_universe(rh: RobinhoodMCP, rules: Rules, symbols: list[str] | None = None) -> list[Stock]:
+    """Distinct stocks + ETFs to screen, each carrying IV rank / IV30 / HV30 / earnings:
 
-    universe: ["most-traded"] top-N by options volume, ["popular"] Robinhood's 100 most popular,
-    or index codes like ["SP500", "NDX"]. `symbols` overrides it.
+      1. top 100 stocks by today's options volume (Russell 3000)
+      2. top 100 stocks + ETFs by today's options volume (adds SPY, QQQ, IWM, TLT, IBIT...)
+      3. Robinhood's "100 most popular" list — kept whole, no volume floor
+
+    `symbols` replaces all three with an explicit list. No price filter anywhere: capped scanner
+    responses are split by price band so every match is kept.
     """
-    liquid = _f("optionsTotalDayVolume", "GREATER_THAN_OR_EQUAL", [rules.min_options_volume])
-    if symbols or universe == [POPULAR]:
-        tickers = [s.upper() for s in symbols] if symbols else await rh.curated_list(POPULAR_LIST)
-        scope = [_f("symbol", "ANY_OF", tickers)]
-    elif universe == [MOST_TRADED]:
-        scope = [] if etfs else [_f("symbol", "IN_LIST", ["Russell3000"])]
-    else:
-        scope = [_f("symbol", "IN_LIST", universe)]
+    if symbols:
+        rows = await scan_all(rh, [_tickers(symbols)])
+        return [stock_from_scan(r) for r in rows]
 
-    if universe == [MOST_TRADED] and not symbols:
-        rows = await scan_top(rh, scope, rules.min_options_volume, top)
+    def top(rows: list[dict]) -> list[Stock]:
         stocks = [stock_from_scan(r) for r in rows]
-        return sorted(stocks, key=lambda s: s.options_volume, reverse=True)[:top]
-    return [stock_from_scan(r) for r in await scan_all(rh, scope + [liquid])]
+        return sorted(stocks, key=lambda s: s.options_volume, reverse=True)[:TOP_N]
+
+    sources = {
+        TOP_STOCKS: top(await scan_top(rh, [_f("symbol", "IN_LIST", ["Russell3000"])], rules.min_options_volume, TOP_N)),
+        TOP_ALL: top(await scan_top(rh, [], rules.min_options_volume, TOP_N)),
+        POPULAR: [stock_from_scan(r) for r in await scan_all(rh, [_tickers(await rh.curated_list(POPULAR_LIST))])],
+    }
+    merged: dict[str, Stock] = {}
+    for tag, stocks in sources.items():
+        for st in stocks:
+            merged.setdefault(st.symbol, st).sources.append(tag)
+    return sorted(merged.values(), key=lambda s: s.options_volume, reverse=True)
 
 
 async def scan_top(rh: RobinhoodMCP, scope: list[dict], min_volume: int, top: int) -> list[dict]:
@@ -98,11 +111,8 @@ async def screen(
     rh: RobinhoodMCP,
     rules: Rules,
     mode: str = "all",
-    universe: list[str] | None = None,
     symbols: list[str] | None = None,
     limit: int = 15,
-    top: int = 100,
-    etfs: bool = False,
     max_evaluate: int = 40,
     today: date | None = None,
 ) -> tuple[dict[str, list[Pick]], Counter]:
@@ -110,8 +120,11 @@ async def screen(
     today = today or date.today()
     stats: Counter = Counter()
 
-    stocks = await load_universe(rh, rules, universe or [MOST_TRADED], symbols, top, etfs)
-    stats["scanned (options volume ok)"] = len(stocks)
+    stocks = await load_universe(rh, rules, symbols)
+    stats["universe (distinct)"] = len(stocks)
+    for tag in (TOP_STOCKS, TOP_ALL, POPULAR):
+        if n := sum(tag in s.sources for s in stocks):
+            stats[tag] = n
 
     candidates: dict[str, list[Pick]] = {st: [] for st in MODES[mode]}
     for s in stocks:
