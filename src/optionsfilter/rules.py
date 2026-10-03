@@ -1,10 +1,15 @@
-"""The 1-month (30–45 DTE) framework as pure functions — no network, easy to test.
+"""The options framework as pure functions — no network, easy to test.
 
-  Sell put    IV rank > 50, |delta| 15–30, no earnings before expiry.
+  Sell put    30–45 DTE. IV rank > 50 AND IV30 > HV30, |delta| 15–30, no earnings before expiry.
   Sell call   Same, covered only, flag ex-dividend before expiry (early assignment).
-  Buy call    IV rank < 30 and IV30 < HV30; direction = your thesis (trend vs 50-day SMA shown as a hint).
+  Buy call    45–90 DTE. IV rank < 30, delta 60–70, and the contract's own IV < HV30
+              (IV30 is a chain average that hides skew). Direction = your thesis.
   Buy put     Same as buy call, bearish side.
-  Liquidity   underlying options volume > 10k/day, contract OI ≥ 100, bid/ask spread < 2% of mid.
+  Liquidity   contract OI ≥ 100, contract volume ≥ 10/day, spread ≤ max($0.05, 3% of mid),
+              underlying total options OI ≥ 10,000.
+
+IV rank and HV30 come from Robinhood's scanner: IV rank = (IV − 52w low) / (52w high − 52w low);
+HV30 = annualized close-to-close stdev of daily log returns over one calendar month.
 """
 
 from __future__ import annotations
@@ -29,17 +34,25 @@ MODES = {
 
 @dataclass
 class Rules:
-    min_dte: int = 30
+    min_dte: int = 30  # sells
     max_dte: int = 45
+    buy_min_dte: int = 45  # buys: room for a ~30-day thesis without holding through the steepest decay
+    buy_max_dte: int = 90
     sell_min_ivr: float = 0.50
     buy_max_ivr: float = 0.30
     sell_delta: tuple[float, float] = (0.15, 0.30)
     sell_target_delta: float = 0.22
-    buy_delta: tuple[float, float] = (0.40, 0.60)
-    buy_target_delta: float = 0.50
+    buy_delta: tuple[float, float] = (0.60, 0.70)  # less extrinsic than ATM, more stock-like
+    buy_target_delta: float = 0.65
     min_options_volume: int = 10_000  # starting floor for the top-100 scans (the 100th name trades far more)
-    min_open_interest: int = 100  # the chosen contract
-    max_spread: float = 0.02  # (ask - bid) / mid
+    min_open_interest: int = 100  # the chosen contract (stale by a day, hence the volume floor too)
+    min_volume: int = 10  # the chosen contract, today
+    min_underlying_oi: int = 10_000  # all contracts on the underlying
+    max_spread: float = 0.03  # allowed spread = max(spread_floor, max_spread × mid)
+    spread_floor: float = 0.05  # dollars
+
+    def dte_window(self, strategy: str) -> tuple[int, int]:
+        return (self.buy_min_dte, self.buy_max_dte) if strategy in BUYS else (self.min_dte, self.max_dte)
 
 
 @dataclass
@@ -54,6 +67,7 @@ class Stock:
     earnings: date | None
     last_ex_div: date | None
     sma50: float | None = None
+    options_oi: int | None = None  # total open interest across the underlying's chain
     sources: list[str] = field(default_factory=list)  # which universe lists it came from
 
     @property
@@ -88,7 +102,12 @@ class Contract:
 
     @property
     def spread(self) -> float:
+        """Spread as a fraction of mid (for display)."""
         return (self.ask - self.bid) / self.mid if self.mid > 0 else math.inf
+
+    @property
+    def width(self) -> float:
+        return self.ask - self.bid
 
 
 @dataclass
@@ -139,6 +158,7 @@ def stock_from_scan(row: dict) -> Stock:
         earnings=ymd(c.get("Earnings date")),
         last_ex_div=ymd(c.get("Ex-dividend date")),
         sma50=num(c.get("SMA50")),
+        options_oi=None if num(c.get("Options OI")) is None else int(num(c.get("Options OI"))),
     )
 
 
@@ -165,11 +185,15 @@ def contract_from(instrument: dict, quote: dict, today: date) -> Contract | None
 
 
 def strategies_for(stock: Stock, rules: Rules, mode: str = "all") -> list[str]:
-    """Every strategy (within `mode`) this stock's volatility qualifies it for; [] = no edge."""
+    """Every strategy (within `mode`) this stock's volatility qualifies it for; [] = no edge.
+
+    Sells need rich IV both vs its own history (rank) and vs realized vol (IV30 > HV30) — high
+    rank alone can just mean the stock became structurally more volatile. Buys only need low
+    rank here; the IV-vs-HV test runs per contract (see contract_problems)."""
     if stock.ivr is None:
         return []
-    sell = stock.ivr >= rules.sell_min_ivr
-    buy = stock.ivr <= rules.buy_max_ivr and stock.iv_hv is not None and stock.iv_hv < 0
+    sell = stock.ivr >= rules.sell_min_ivr and stock.iv_hv is not None and stock.iv_hv > 0
+    buy = stock.ivr <= rules.buy_max_ivr
     return [st for st in MODES[mode] if (sell and st not in BUYS) or (buy and st in BUYS)]
 
 
@@ -205,9 +229,8 @@ def candidate_expirations(expirations: list[str], stock: Stock, strategy: str, r
     when any exist.
 
     Returns (expirations, earnings_in_window)."""
-    window = sorted(
-        d for d in expirations if rules.min_dte <= (date.fromisoformat(d) - today).days <= rules.max_dte
-    )
+    lo, hi = rules.dte_window(strategy)
+    window = sorted(d for d in expirations if lo <= (date.fromisoformat(d) - today).days <= hi)
     if not window:
         return [], False
     if strategy not in BUYS:
@@ -225,7 +248,9 @@ def strike_band(stock: Stock, strategy: str, dte: int) -> tuple[float, float]:
         return p - 1.8 * sigma, p - 0.2 * sigma
     if strategy == SELL_CALL:
         return p + 0.2 * sigma, p + 1.6 * sigma
-    return p - 0.4 * sigma, p + 0.4 * sigma
+    if strategy == BUY_CALL:  # delta 0.60–0.70 is slightly in the money
+        return p - 1.0 * sigma, p + 0.1 * sigma
+    return p - 0.1 * sigma, p + 1.0 * sigma
 
 
 # --- contract-level rules -----------------------------------------------------------
@@ -237,23 +262,39 @@ def delta_range(strategy: str, rules: Rules) -> tuple[tuple[float, float], float
     return rules.sell_delta, rules.sell_target_delta
 
 
-def liquidity_problems(c: Contract, rules: Rules) -> list[str]:
+def max_width(c: Contract, rules: Rules) -> float:
+    """Allowed bid/ask width: a dollar floor for cheap contracts, a percentage for expensive ones."""
+    return max(rules.spread_floor, rules.max_spread * c.mid)
+
+
+def contract_problems(c: Contract, rules: Rules, strategy: str = SELL_PUT, stock: Stock | None = None) -> list[str]:
     problems = []
     if c.open_interest < rules.min_open_interest:
         problems.append(f"OI {c.open_interest:,} < {rules.min_open_interest:,}")
-    if c.spread > rules.max_spread:
-        problems.append(f"spread {c.spread:.1%} > {rules.max_spread:.0%}")
+    if c.volume < rules.min_volume:
+        problems.append(f"volume {c.volume:,} < {rules.min_volume:,}")
+    if c.width > max_width(c, rules) + 1e-9:
+        problems.append(f"spread ${c.width:.2f} > ${max_width(c, rules):.2f}")
+    if strategy in BUYS and stock is not None and stock.hv30 is not None and (c.iv is None or c.iv >= stock.hv30):
+        problems.append(f"contract IV {pct_or_dash(c.iv)} ≥ HV30 {stock.hv30:.0%}")
     return problems
 
 
-def best_contract(contracts: list[Contract], strategy: str, rules: Rules) -> tuple[Contract | None, list[str]]:
-    """Closest to target delta among liquid contracts; otherwise the least-bad illiquid one."""
+def pct_or_dash(x: float | None) -> str:
+    return "-" if x is None else f"{x:.0%}"
+
+
+def best_contract(
+    contracts: list[Contract], strategy: str, rules: Rules, stock: Stock | None = None
+) -> tuple[Contract | None, list[str]]:
+    """Closest to target delta among contracts that pass; otherwise the least-bad one."""
     (lo, hi), target = delta_range(strategy, rules)
     in_range = [c for c in contracts if lo <= abs(c.delta) <= hi]
     if not in_range:
         return None, [f"no contract with |delta| {lo:.2f}–{hi:.2f}"]
-    liquid = [c for c in in_range if not liquidity_problems(c, rules)]
-    if liquid:
-        return min(liquid, key=lambda c: abs(abs(c.delta) - target)), []
-    closest = min(in_range, key=lambda c: (len(liquidity_problems(c, rules)), c.spread))
-    return closest, liquidity_problems(closest, rules)
+    problems = {id(c): contract_problems(c, rules, strategy, stock) for c in in_range}
+    ok = [c for c in in_range if not problems[id(c)]]
+    if ok:
+        return min(ok, key=lambda c: abs(abs(c.delta) - target)), []
+    closest = min(in_range, key=lambda c: (len(problems[id(c)]), c.spread))
+    return closest, problems[id(closest)]

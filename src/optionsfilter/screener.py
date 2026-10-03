@@ -19,6 +19,7 @@ SCAN_COLUMNS = [
     {"display_name": "Earnings date", "expression": "fundamental.earningsYmd"},
     {"display_name": "Ex-dividend date", "expression": "fundamental.exYmd"},
     {"display_name": "SMA50", "expression": 'closeAvg(candleCount=50, candlePeriod="1d", session="all")'},
+    {"display_name": "Options OI", "expression": "optionsTotalOpenInterest"},
 ]
 CONCURRENCY = 6
 SCAN_CAP = 200  # rows per scanner response
@@ -128,9 +129,12 @@ async def screen(
 
     candidates: dict[str, list[Pick]] = {st: [] for st in MODES[mode]}
     for s in stocks:
+        if s.options_oi is not None and s.options_oi < rules.min_underlying_oi:
+            stats[f"underlying options OI < {rules.min_underlying_oi:,}"] += 1
+            continue
         strategies = strategies_for(s, rules, mode)
         if not strategies:
-            stats["no IV edge (IVR between buy/sell thresholds)"] += 1
+            stats["no IV edge"] += 1
         for st in strategies:
             candidates[st].append(Pick(s, st))
 
@@ -169,10 +173,12 @@ async def screen(
 def _reason(problem: str, rules: Rules) -> str:
     for prefix, label in (
         ("earnings", "earnings before expiry"),
-        ("spread", f"bid/ask spread > {rules.max_spread:.0%}"),
+        ("spread", f"spread > max(${rules.spread_floor:.2f}, {rules.max_spread:.0%} of mid)"),
         ("OI", f"open interest < {rules.min_open_interest:,}"),
+        ("volume", f"contract volume < {rules.min_volume:,}"),
+        ("contract IV", "contract IV ≥ HV30 (buys)"),
         ("no contract", "no contract in delta range"),
-        ("no expiry", f"no {rules.min_dte}–{rules.max_dte} DTE expiry"),
+        ("no expiry", "no expiry in DTE window"),
     ):
         if problem.startswith(prefix):
             return label
@@ -193,7 +199,8 @@ async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date, cach
 
     expirations, earnings_hit = candidate_expirations(chain["expiration_dates"], s, strategy, rules, today)
     if not expirations:
-        pick.problems.append(f"no expiry {rules.min_dte}–{rules.max_dte} DTE")
+        lo, hi = rules.dte_window(strategy)
+        pick.problems.append(f"no expiry {lo}–{hi} DTE")
         return
     if earnings_hit:
         msg = f"earnings {s.earnings:%m-%d} before expiry"
@@ -209,7 +216,7 @@ async def evaluate(rh: RobinhoodMCP, pick: Pick, rules: Rules, today: date, cach
     quotes = await rh.option_quotes([i["id"] for i in instruments])
     contracts = [c for i in instruments if i["id"] in quotes and (c := contract_from(i, quotes[i["id"]], today))]
 
-    pick.contract, problems = best_contract(contracts, strategy, rules)
+    pick.contract, problems = best_contract(contracts, strategy, rules, s)
     pick.problems += problems
 
     if strategy == SELL_CALL:

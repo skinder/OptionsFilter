@@ -16,10 +16,10 @@ from optionsfilter.screener import screen
 
 
 RULE_SUMMARY = {
-    SELL_PUT: "IV rank > 50, |delta| 15–30, no earnings before expiry",
-    SELL_CALL: "IV rank > 50, delta 15–30, no earnings; COVERED ONLY, watch ex-dividend dates",
-    BUY_CALL: "IV rank < 30, IV30 < HV30, delta ~50; bullish thesis that fits inside 30 days",
-    BUY_PUT: "IV rank < 30, IV30 < HV30, delta ~50; bearish thesis that fits inside 30 days",
+    SELL_PUT: "30–45 DTE, IV rank > 50, IV30 > HV30, |delta| 15–30, no earnings before expiry",
+    SELL_CALL: "30–45 DTE, IV rank > 50, IV30 > HV30, delta 15–30, no earnings; COVERED ONLY, watch ex-div",
+    BUY_CALL: "45–90 DTE, IV rank < 30, delta 60–70, contract IV < HV30; bullish thesis",
+    BUY_PUT: "45–90 DTE, IV rank < 30, |delta| 60–70, contract IV < HV30; bearish thesis",
 }
 
 
@@ -43,9 +43,11 @@ def row(n: int, p: Pick) -> dict[str, str]:
         "Strike": f"{c.strike:g}{c.type[0].upper()}" if c else "-",
         "Delta": f"{c.delta:+.2f}" if c else "-",
         "Theta": f"{c.theta:.3f}" if c and c.theta is not None else "-",
+        "C.IV": pct(c.iv) if c else "-",
         "Bid/Ask": f"{c.bid:.2f}/{c.ask:.2f}" if c else "-",
         "Spread": pct(c.spread, 1) if c else "-",
         "OI": f"{c.open_interest:,}" if c else "-",
+        "Vol": f"{c.volume:,}" if c else "-",
         "Status": "PASS" if p.passed else "; ".join(p.problems),
         "Notes": "; ".join(p.notes),
     }
@@ -59,7 +61,7 @@ def csv_row(n: int, p: Pick) -> dict:
         "rank": n, "status": "PASS" if p.passed else "near miss", "symbol": s.symbol, "name": s.name,
         "price": s.price, "strategy": p.strategy, "iv_rank": r4(s.ivr), "iv30": r4(s.iv30), "hv30": r4(s.hv30),
         "iv_minus_hv": r4(s.iv_hv), "sma50": s.sma50,
-        "vs_sma50": r4(s.price / s.sma50 - 1) if s.sma50 else None, "options_volume": s.options_volume,
+        "vs_sma50": r4(s.price / s.sma50 - 1) if s.sma50 else None, "options_volume": s.options_volume, "options_open_interest": s.options_oi,
         "lists": " ".join(s.sources),
         "earnings_date": s.earnings.isoformat() if s.earnings else None,
         "expiration": c.expiration if c else None, "dte": c.dte if c else None,
@@ -98,10 +100,16 @@ def main(argv: list[str] | None = None) -> None:
                    help="all = sell put + sell call (IVR>50) and buy call + buy put (IVR<30 & IV30<HV30)")
     p.add_argument("--symbols", nargs="+", help="screen only these tickers instead of the default universe")
     p.add_argument("--limit", type=int, default=15, help="rows per strategy")
-    p.add_argument("--min-dte", type=int, default=30)
-    p.add_argument("--max-dte", type=int, default=45)
+    p.add_argument("--min-dte", type=int, default=30, help="sells")
+    p.add_argument("--max-dte", type=int, default=45, help="sells")
+    p.add_argument("--buy-min-dte", type=int, default=45)
+    p.add_argument("--buy-max-dte", type=int, default=90)
     p.add_argument("--min-oi", type=int, default=100, help="contract open interest")
-    p.add_argument("--max-spread", type=float, default=0.02, help="bid/ask spread as fraction of mid")
+    p.add_argument("--min-volume", type=int, default=10, help="contract volume today")
+    p.add_argument("--min-chain-oi", type=int, default=10_000, help="total options open interest on the underlying")
+    p.add_argument("--max-spread", type=float, default=0.03,
+                   help="allowed spread = max(--spread-floor, this × mid); default 3%%")
+    p.add_argument("--spread-floor", type=float, default=0.05, help="dollars")
     p.add_argument("--csv", help="CSV path (default: results/optionsfilter_<mode>_<date>_<time>.csv)")
     p.add_argument("--no-csv", action="store_true", help="don't save a CSV")
     p.add_argument("--login", action="store_true", help="authorize with Robinhood and exit")
@@ -115,8 +123,9 @@ def main(argv: list[str] | None = None) -> None:
         print("Cached tokens removed.")
         return
 
-    rules = Rules(min_dte=args.min_dte, max_dte=args.max_dte, min_open_interest=args.min_oi,
-                  max_spread=args.max_spread)
+    rules = Rules(min_dte=args.min_dte, max_dte=args.max_dte, buy_min_dte=args.buy_min_dte,
+                  buy_max_dte=args.buy_max_dte, min_open_interest=args.min_oi, min_volume=args.min_volume,
+                  min_underlying_oi=args.min_chain_oi, max_spread=args.max_spread, spread_floor=args.spread_floor)
 
     async def run() -> None:
         async with RobinhoodMCP() as rh:
@@ -125,7 +134,7 @@ def main(argv: list[str] | None = None) -> None:
                 return
             label = ' '.join(args.symbols) if args.symbols else (
                 "top 100 stocks + top 100 incl. ETFs (by options volume) + Robinhood 100 most popular")
-            print(f"Screening {label} for {args.min_dte}–{args.max_dte} DTE "
+            print(f"Screening {label} "
                   f"({args.mode})...", file=sys.stderr)
             results, stats = await screen(rh, rules, args.mode, args.symbols, args.limit)
 

@@ -43,7 +43,10 @@ def test_strategy_selection():
     assert strategies_for(stock(ivr=0.55), RULES, "sell-call") == [SELL_CALL]
     assert strategies_for(stock(ivr=0.20, iv30=0.25, hv30=0.30), RULES) == [BUY_CALL, BUY_PUT]
     assert strategies_for(stock(ivr=0.20, iv30=0.25, hv30=0.30), RULES, "buy-put") == [BUY_PUT]
-    assert strategies_for(stock(ivr=0.20, iv30=0.35, hv30=0.30), RULES) == []  # IV above HV
+    # Buys no longer need IV30 < HV30 at stock level (checked per contract instead)
+    assert strategies_for(stock(ivr=0.20, iv30=0.35, hv30=0.30), RULES) == [BUY_CALL, BUY_PUT]
+    # Sells need IV30 > HV30 as well as high rank
+    assert strategies_for(stock(ivr=0.80, iv30=0.30, hv30=0.45), RULES) == []
     assert strategies_for(stock(ivr=0.40), RULES) == []  # no edge
     assert strategies_for(stock(ivr=0.55), RULES, "buy") == []
 
@@ -62,7 +65,7 @@ def test_seller_picks_expiry_before_earnings():
     s = stock(earnings=date(2026, 10, 20))
     assert candidate_expirations(exps, s, SELL_PUT, RULES, TODAY) == (["2026-10-30", "2026-11-06"], True)
     assert candidate_expirations(["2026-10-16"], s, SELL_PUT, RULES, TODAY) == ([], False)
-    assert candidate_expirations(exps, stock(earnings=None), BUY_CALL, RULES, TODAY) == (["2026-10-30", "2026-11-06"], False)
+    assert candidate_expirations(exps, stock(earnings=None), BUY_CALL, RULES, TODAY) == (["2026-11-20"], False)  # 45–90 DTE
 
 
 def test_ex_div_projection():
@@ -86,6 +89,45 @@ def test_best_contract_picks_liquid_expiry_over_newest_weekly():
     assert best_contract([new_weekly, older], SELL_PUT, RULES) == (older, [])
 
 
+def test_spread_rule_uses_dollar_floor_and_percent():
+    from optionsfilter.rules import contract_problems
+
+    cheap = contract(-0.20, bid=0.48, ask=0.52)  # $0.04 wide on $0.50 mid: fine under the $0.05 floor
+    assert contract_problems(cheap, RULES) == []
+    pricey = contract(-0.20, bid=19.70, ask=20.30)  # $0.60 > 3% of $20 = $0.60? equal -> ok
+    assert contract_problems(pricey, RULES) == []
+    wide = contract(-0.20, bid=19.50, ask=20.50)  # $1.00 > $0.60
+    assert contract_problems(wide, RULES) == ["spread $1.00 > $0.60"]
+
+
+def test_contract_volume_floor():
+    from optionsfilter.rules import contract_problems
+
+    c = contract(-0.20)
+    c.volume = 3
+    assert contract_problems(c, RULES) == ["volume 3 < 10"]
+
+
+def test_buys_judge_the_contracts_own_iv_against_hv30():
+    from optionsfilter.rules import contract_problems
+
+    s = stock(ivr=0.2, iv30=0.25, hv30=0.30)
+    cheap_call = contract(0.65, type_="call")
+    cheap_call.iv = 0.27
+    rich_put = contract(-0.65)
+    rich_put.iv = 0.34  # skew: puts richer than the chain average
+    assert contract_problems(cheap_call, RULES, BUY_CALL, s) == []
+    assert contract_problems(rich_put, RULES, BUY_PUT, s) == ["contract IV 34% ≥ HV30 30%"]
+    assert contract_problems(rich_put, RULES, SELL_PUT, s) == []  # sells don't apply it
+
+
+def test_buys_use_their_own_dte_window_and_delta():
+    exps = ["2026-10-30", "2026-11-06", "2026-11-20", "2026-12-18", "2027-01-15"]
+    assert candidate_expirations(exps, stock(earnings=None), BUY_CALL, RULES, TODAY)[0] == ["2026-11-20", "2026-12-18"]
+    c, problems = best_contract([contract(0.50, type_="call"), contract(0.66, type_="call")], BUY_CALL, RULES)
+    assert c.delta == 0.66 and problems == []
+
+
 def test_best_contract_reports_liquidity_failures():
     c, problems = best_contract([contract(-0.21, oi=50, bid=1.0, ask=1.1)], SELL_PUT, RULES)
     assert c.delta == -0.21
@@ -107,7 +149,7 @@ class FakeRH:
             _scan("GOOD", ivr="0.70", earnings="2.0261120e+07"),  # passes
             _scan("EARN", ivr="0.80", earnings="2.0261001e+07"),  # earnings before every expiry
             _scan("MEH", ivr="0.40"),  # no edge
-            _scan("CHEAP", ivr="0.10", iv="0.20", hv="0.30"),  # buy candidate
+            _scan("CHEAP", ivr="0.10", iv="0.20", hv="0.50"),  # buy candidate; contract IV 40% < HV 50%
         ]
 
     async def scan(self, filters, columns):
@@ -119,7 +161,7 @@ class FakeRH:
     async def option_chains(self, symbol):
         self.chains_requested = getattr(self, "chains_requested", []) + [symbol]
         return [{"id": f"chain-{symbol}", "symbol": symbol,
-                 "expiration_dates": ["2026-10-16", "2026-10-30", "2026-11-06"]}]
+                 "expiration_dates": ["2026-10-16", "2026-10-30", "2026-11-06", "2026-12-18"]}]
 
     async def option_instruments(self, chain_id, expiration, option_type):
         sym = chain_id.split("-")[1]
@@ -155,8 +197,9 @@ def test_screen_end_to_end():
     assert sp["GOOD"].passed and sp["GOOD"].contract.strike == 90 and sp["GOOD"].contract.type == "put"
     assert sc["GOOD"].passed and sc["GOOD"].contract.strike == 110 and sc["GOOD"].contract.type == "call"
     assert "covered only" in sc["GOOD"].notes
-    assert bc["CHEAP"].passed and bc["CHEAP"].contract.delta == 0.50
-    assert bp["CHEAP"].passed and bp["CHEAP"].contract.delta == -0.50
+    assert bc["CHEAP"].passed and bc["CHEAP"].contract.delta == 0.70
+    assert bp["CHEAP"].passed and bp["CHEAP"].contract.delta == -0.70
+    assert bc["CHEAP"].contract.expiration == "2026-12-18"  # 45–90 DTE for buys
     assert not sp["EARN"].passed and "earnings" in sp["EARN"].problems[0]
     assert "MEH" not in sp and "CHEAP" not in sp and "GOOD" not in bc
     assert [p.stock.symbol for p in results[SELL_PUT]][-1] == "EARN"  # passes before near misses
